@@ -1,0 +1,11 @@
+# Patternverse MIS API — dependencies
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+httpx==0.28.1
+pydantic==2.10.4
+pydantic-settings==2.7.1
+python-dotenv==1.0.1
+# Supabase client (production storage backend).
+# The API also ships an in-memory fallback, so this is only required
+# once you point APP_ENV/SUPABASE_* at a real Supabase project.
+supabase==2.11.0
