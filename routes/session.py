@@ -91,12 +91,12 @@ async def reply(req: SessionReplyRequest) -> SessionReplyResponse:
     if upcoming_turn < conversation.SYNTHESIS_MIN_TURN:
         # Turns 1-5: listen + reflect + ask, never synthesize. If the model still
         # insists on emitting a pattern, fall back to a generic question.
-        text = await conversation.converse(history)
+        text = await conversation.converse(history, upcoming_turn)
         if conversation.parse_pattern(text) is not None:
             text = conversation.FALLBACK_QUESTION
     elif upcoming_turn < conversation.FORCE_SYNTHESIS_TURN:
         # Turns 6-9: synthesize only if a clear pattern emerges, else keep listening.
-        text = await conversation.converse(history, allow_synthesis=True)
+        text = await conversation.converse(history, upcoming_turn, allow_synthesis=True)
         pattern = conversation.parse_pattern(text)
     else:
         # Turn 10+: force synthesis (retries once on invalid JSON).

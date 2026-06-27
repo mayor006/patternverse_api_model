@@ -69,24 +69,25 @@ async def _generate_ollama(messages: List[Dict[str, str]], settings: Settings) -
     return content.strip()
 
 
-# ── Hugging Face Inference API (production) ────────────────────────────
+# ── Hugging Face Inference Providers (production) ──────────────────────
 async def _generate_huggingface(messages: List[Dict[str, str]], settings: Settings) -> str:
+    """Call the HF router's OpenAI-compatible chat completions endpoint.
+
+    The router accepts the chat ``messages`` list directly (system/user/assistant
+    roles) and auto-selects an available inference provider for the model.
+    """
     if not settings.hf_api_token:
         raise ModelUnavailableError(
             "HF_API_TOKEN is not set but APP_ENV=production. "
             "Add a Hugging Face token to use the production backend."
         )
 
-    prompt = _to_mistral_prompt(messages)
     headers = {"Authorization": f"Bearer {settings.hf_api_token}"}
     payload = {
-        "inputs": prompt,
-        "parameters": {
-            "max_new_tokens": 512,
-            "temperature": 0.7,
-            "return_full_text": False,
-        },
-        "options": {"wait_for_model": True},
+        "model": settings.hf_model,
+        "messages": messages,
+        "max_tokens": 512,
+        "temperature": 0.7,
     }
     try:
         async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as client:
@@ -102,46 +103,11 @@ async def _generate_huggingface(messages: List[Dict[str, str]], settings: Settin
         logger.error("Could not reach Hugging Face: %s", exc)
         raise ModelUnavailableError("Could not reach the Hugging Face Inference API.") from exc
 
-    # HF text-generation returns [{"generated_text": "..."}]; be defensive.
-    if isinstance(data, list) and data:
-        return str(data[0].get("generated_text", "")).strip()
     if isinstance(data, dict):
-        if "generated_text" in data:
-            return str(data["generated_text"]).strip()
         if "error" in data:
             raise ModelUnavailableError(f"Hugging Face error: {data['error']}")
+        choices = data.get("choices")
+        if choices:
+            content = (choices[0].get("message") or {}).get("content", "")
+            return str(content).strip()
     raise ModelUnavailableError("Unexpected response shape from Hugging Face.")
-
-
-def _to_mistral_prompt(messages: List[Dict[str, str]]) -> str:
-    """Render chat messages into the Mistral-Instruct prompt template.
-
-    Mistral instruct models have no dedicated system role, so the system prompt
-    is folded into the first user instruction:
-
-        <s>[INST] {system}\\n\\n{user1} [/INST] {assistant1}</s>[INST] {user2} [/INST]
-    """
-    system = next((m["content"] for m in messages if m["role"] == "system"), "")
-    convo = [m for m in messages if m["role"] in ("user", "assistant")]
-
-    # The template must begin with a user turn. If the stored history starts
-    # with the assistant's opening question, inject a minimal kickoff turn.
-    if not convo or convo[0]["role"] != "user":
-        convo = [{"role": "user", "content": _KICKOFF}] + convo
-
-    parts: List[str] = []
-    system_injected = False
-    for m in convo:
-        if m["role"] == "user":
-            text = m["content"]
-            if not system_injected and system:
-                text = f"{system}\n\n{text}"
-                system_injected = True
-            parts.append(f"[INST] {text} [/INST]")
-        else:  # assistant
-            parts.append(f" {m['content']}</s>")
-    return "<s>" + "".join(parts)
-
-
-# Used to elicit the very first question when no user turn exists yet.
-_KICKOFF = "I'm ready to begin. Ask me your first question, one at a time."

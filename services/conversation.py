@@ -20,27 +20,39 @@ from services.model_service import generate_response
 
 logger = logging.getLogger("patternverse.conversation")
 
-# ── The exact system prompt for every conversation (do not edit) ───────
-SYSTEM_PROMPT = """You are the Patternverse Mirror Intelligence System. Your job is to surface the emotional and behavioral patterns a user keeps repeating — without giving advice, without judgment, and without rushing to conclusions.
+# ── The canonical system prompt for every conversation ─────────────────
+# Grounded in Patternverse_Mirror_Intelligence_System_v1.0: the mirror stays a
+# mirror, and questioning traces the meaning chain rather than circling one link.
+SYSTEM_PROMPT = """You are the Patternverse Mirror Intelligence System. Governing doctrine: the mirror stays a mirror. You help a person see the pattern beneath their problem by tracing — one careful step at a time — the chain that links what happened to what they keep repeating:
 
-Your method:
-- Ask one precise, emotionally intelligent question at a time
-- Each question must build directly on what the user just said
-- Listen for: repeated words, emotional contradictions, avoidance language, self-blame, and deflection
-- Never give advice or interpretation until the SYNTHESIS stage
-- After 6-10 exchanges, if a clear pattern is visible, move to synthesis
+  Event → Meaning → Emotion → Reaction → Outcome → Repetition → Pattern
 
-Synthesis format — return ONLY this JSON when the pattern is clear:
+You are not a chatbot, a coach, or a therapist. You reflect; you do not advise, flatter, judge, diagnose, or reassure.
+
+HOW YOU ASK
+- Ask exactly ONE question per turn, and make it move FORWARD along the chain. Never re-ask something already answered. Once you have the event, go after the meaning; then the emotion and the need or fear beneath it; then the reaction; then the outcome and its cost; then whether it has happened before.
+- Build every question from the user's own words — echo a specific detail they gave, then go one layer deeper. Never use templates like "You mentioned…", "You said…", or "It sounds like… you feel".
+- Listen for: the meaning the user assigned to an event, the need or fear underneath, hidden beliefs, self-blame, avoidance or deflection, contradictions, and identity language ("I'm the kind of person who…").
+- If the user is vague, ask for ONE concrete instance — a specific time it happened — rather than asking how they feel again.
+
+DRIFT CONTROL (non-negotiable)
+- Portrait drift: never flatter, advise, judge, or reassure to feel pleasing.
+- Generic drift: never reach for a plausible, pre-written-sounding insight. Trace THIS person's specifics only.
+- Repetition before loop: never name a "loop" or "pattern" until the same trigger→reaction has appeared in at least THREE separate instances. One moment is not a loop.
+- Insufficiency before fabrication: if the signal is too thin to name anything honestly, keep asking — never invent a pattern to seem insightful.
+- Sovereignty before certainty: the user is the authority on their own meaning. Offer reflection as something they can accept, edit, or reject — never as a verdict.
+
+SYNTHESIS — return ONLY this JSON object (and nothing else) once a genuine repeating pattern (three instances) is visible:
 {
-  "pattern_name": "short evocative name e.g. Proximity Withdrawal Loop",
-  "pattern_summary": "2-3 sentences describing the pattern clearly and without shame",
-  "trigger": "what usually activates this pattern",
-  "response": "what the user typically does when triggered",
-  "insight": "one precise observation that makes the pattern visible",
-  "next_step": "one small concrete action — not advice, just an option"
+  "pattern_name": "short, evocative, non-clinical name e.g. Proximity Withdrawal Loop",
+  "pattern_summary": "2-3 sentences naming the recurring chain in the user's own terms, without shame or diagnosis",
+  "trigger": "the event or situation that reliably activates it",
+  "response": "what the user characteristically does when triggered",
+  "insight": "one precise observation that makes the pattern visible — drawn only from what the user actually said",
+  "next_step": "one small, concrete option the user could choose — an option, never a prescription"
 }
 
-Tone: calm, intelligent, emotionally precise. Never clinical, never motivational, never spiritual."""
+Tone: calm, intelligent, emotionally precise. Never clinical, never motivational, never spiritual, never gushing."""
 
 # An instruction appended (NOT stored) when we explicitly ask for synthesis,
 # e.g. at turn 10+ or on /session/end.
@@ -51,31 +63,106 @@ _SYNTHESIS_NUDGE = (
     "Output only the JSON object and nothing else."
 )
 
-# Appended (NOT stored) on early turns, where synthesis isn't allowed yet. Steers
-# the model to LISTEN and reflect first, then ask — so it feels like a conversation,
-# not a form. (This is "mirror before advice" from the doctrine.)
-_QUESTION_NUDGE = (
-    "Respond the way a warm, attentive friend who is really listening would — natural and "
-    "human, never like a clinician or a form. React naturally to what I just said and show "
-    "you understood the specific feeling I named — but do NOT begin with stock phrases like "
-    "'You mentioned', 'You said', or 'You feel', and never just swap one emotion word into a "
-    "fixed template. Then ask me exactly ONE genuine, curious follow-up question that goes "
-    "deeper into my particular situation (one question only — not two or three). It is still "
-    "early, so do not summarize, diagnose, give advice, or output any JSON yet. Keep the "
-    "whole reply to two or three sentences."
+# The meaning chain from the doctrine: each question should advance to the NEXT
+# unexplored link rather than circling the one already covered. Keyed by the
+# upcoming assistant turn so the conversation moves Event → … → Repetition.
+_CHAIN_STAGES = {
+    2: (
+        "the concrete event — if what I've said is still abstract, ask for one specific recent "
+        "moment it actually happened; if the moment is already clear, move on to what that "
+        "moment MEANT to me"
+    ),
+    3: (
+        "the meaning — what I made that event mean about myself, the other person, or my "
+        "situation"
+    ),
+    4: (
+        "the emotion and the need or fear underneath it — the feeling actually driving my "
+        "reaction, not just its surface label"
+    ),
+    5: "the reaction — what I concretely did or do when that feeling hits",
+    6: (
+        "the outcome and its cost — what results from that reaction, and a first hint of whether "
+        "this has played out before"
+    ),
+}
+
+# Focus once synthesis is on the table (turns 6-9): probe recurrence to test the
+# three-instance threshold before any pattern may be named.
+_RECURRENCE_FOCUS = (
+    "other specific times this same trigger-and-reaction has happened — you are testing whether "
+    "it genuinely recurs across three separate instances before naming anything"
 )
 
-# Appended (NOT stored) on the 6-9 window, where synthesis is allowed if the pattern
-# is clear. Either synthesize (clean JSON) or keep listening warmly.
-_OPEN_NUDGE = (
-    "If a clear, repeating pattern is genuinely visible now from what I've told you, output "
-    "ONLY the synthesis JSON object with keys pattern_name, pattern_summary, trigger, "
-    "response, insight, next_step — nothing else. Otherwise, respond like a warm friend who "
-    "is really listening: react naturally to what I just said (do NOT start with 'You "
-    "mentioned', 'You said', or 'You feel', and don't use a template), then ask exactly ONE "
-    "genuine, curious follow-up question that goes deeper (one question only). No advice. "
-    "Two or three sentences."
+
+# Appended (NOT stored) on early turns, where synthesis isn't allowed yet. Steers the
+# model to reflect first, then ask the ONE question that moves us to the next link in
+# the chain — never sideways into ground already covered.
+def _question_nudge(focus: str) -> str:
+    return (
+        "Reply like a warm, attentive person who is genuinely listening — natural and human, "
+        "never a clinician or a form. First, react to the SPECIFIC thing I just said (echo a real "
+        "detail of mine, but never with stock openers like 'You mentioned', 'You said', 'It sounds "
+        "like', or 'You feel', and never just swap one emotion word into a template). Then ask me "
+        f"exactly ONE genuine question that moves us forward to {focus}. "
+        "Crucially: do NOT re-ask anything I've already answered — look back over everything I've "
+        "told you and go one layer deeper, never sideways into the same ground. One question only. "
+        "It is still early: no summary, no advice, no diagnosis, no JSON. Two or three sentences."
+    )
+
+
+# Appended (NOT stored) on the 6-9 window, where synthesis is allowed once the same
+# trigger→reaction has recurred three times. Be decisive: synthesize as soon as the
+# threshold is met instead of fishing for more examples.
+def _open_nudge(focus: str) -> str:
+    return (
+        "Count the distinct instances I've described where the SAME trigger led to the SAME "
+        "reaction. If that count is three or more, you MUST output ONLY the synthesis JSON object "
+        "now (keys: pattern_name, pattern_summary, trigger, response, insight, next_step) and "
+        "nothing else — do NOT ask for further examples once three are present. If it is still "
+        "fewer than three, do not name a pattern yet: react naturally to what I just said (no "
+        "'You mentioned/said/feel' templates), then ask exactly ONE question that moves us toward "
+        f"{focus}, without re-asking anything I've already answered. No advice. Two or three "
+        "sentences."
+    )
+
+
+# Stock openers the doctrine forbids (template restatement = portrait/generic drift).
+# Used to detect a low-quality reply and trigger a single regenerate, then a
+# deterministic strip as a last resort.
+_BANNED_OPENER = re.compile(
+    r"^\s*(it sounds like|it seems like|it seems that|you mentioned|you said|"
+    r"you feel|you're feeling|you are feeling|i hear that|i can hear|i can see that)\b",
+    re.IGNORECASE,
 )
+_ANTI_OPENER_RIDER = (
+    " IMPORTANT: do NOT begin your reply with 'It sounds like', 'It seems', 'You mentioned', "
+    "'You said', 'You feel', 'I hear that', or any restatement of my words. Open instead with a "
+    "fresh, specific reaction in your own voice."
+)
+
+
+def _has_banned_opener(text: str) -> bool:
+    return bool(text) and bool(_BANNED_OPENER.match(text))
+
+
+def _strip_stock_opener(text: str) -> str:
+    """Last-resort deterministic cleanup: drop a leading 'It sounds like'-style clause.
+
+    Only rewrites the safe prefixes that leave a grammatical sentence when removed
+    (e.g. 'It sounds like you withdrew…' → 'You withdrew…'). Leaves anything else
+    untouched rather than risk mangling the reply.
+    """
+    m = re.match(
+        r"^\s*(it sounds like|it seems like|it seems that|i hear that|i can hear|"
+        r"i can see that)\s+",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return text
+    rest = text[m.end():]
+    return rest[:1].upper() + rest[1:] if rest else text
 
 # Kickoff turn used to elicit the opening question. Giving the model a concrete
 # first-person user turn (rather than a lone system prompt) keeps it grounded in
@@ -147,14 +234,41 @@ async def generate_opening() -> str:
 
 
 async def converse(
-    stored_messages: List[Dict[str, str]], allow_synthesis: bool = False
+    stored_messages: List[Dict[str, str]],
+    upcoming_turn: int,
+    allow_synthesis: bool = False,
 ) -> str:
-    """Generate the next assistant turn — a warm, reflective question (and, when
-    `allow_synthesis` is set, a synthesis JSON instead if the pattern is clear).
+    """Generate the next assistant turn — a warm, reflective question that advances
+    along the meaning chain (and, when `allow_synthesis` is set, a synthesis JSON
+    instead if the same trigger→reaction has recurred three times).
+
+    `upcoming_turn` selects which link in the chain to probe so the conversation
+    moves forward (Event → Meaning → Emotion → Reaction → Outcome → Repetition)
+    instead of re-asking the same dimension.
     """
-    nudge = _OPEN_NUDGE if allow_synthesis else _QUESTION_NUDGE
+    if allow_synthesis:
+        nudge = _open_nudge(_RECURRENCE_FOCUS)
+    else:
+        # Past the explicit early stages, keep tracing toward recurrence.
+        focus = _CHAIN_STAGES.get(upcoming_turn, _RECURRENCE_FOCUS)
+        nudge = _question_nudge(focus)
+
     messages = build_model_messages(stored_messages, nudge=nudge)
-    return _clean(await generate_response(messages))
+    text = _clean(await generate_response(messages))
+
+    # A valid synthesis JSON is exempt from opener checks; only police questions.
+    if parse_pattern(text) is None and _has_banned_opener(text):
+        # Re-roll once with an explicit anti-template rider; the small model often
+        # complies on the second pass.
+        retry_messages = build_model_messages(stored_messages, nudge=nudge + _ANTI_OPENER_RIDER)
+        retry = _clean(await generate_response(retry_messages))
+        if retry and (parse_pattern(retry) is not None or not _has_banned_opener(retry)):
+            text = retry
+        else:
+            # Still templated — strip the leading clause deterministically.
+            text = _strip_stock_opener(text)
+
+    return text
 
 
 async def synthesize(

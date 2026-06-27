@@ -19,12 +19,11 @@ class Settings(BaseSettings):
     supabase_anon_key: str = ""
     supabase_service_key: str = ""
 
-    # Hugging Face (production)
+    # Hugging Face (production) — OpenAI-compatible Inference Providers router.
+    # The legacy api-inference.huggingface.co endpoint was decommissioned in 2025.
     hf_api_token: str = ""
-    hf_model_url: str = (
-        "https://api-inference.huggingface.co/models/"
-        "mistralai/Mistral-7B-Instruct-v0.3"
-    )
+    hf_model_url: str = "https://router.huggingface.co/v1/chat/completions"
+    hf_model: str = "Qwen/Qwen2.5-7B-Instruct"
 
     # Ollama (local dev)
     ollama_base_url: str = "http://localhost:11434"
