@@ -52,18 +52,177 @@ Errors come back as FastAPI's standard envelope:
 | Method | Path | Purpose |
 |--------|------|---------|
 | `GET`  | `/health` | Liveness + which environment/model is active |
-| `POST` | `/session/start` | Begin a session; get the opening question |
-| `POST` | `/session/reply` | Send a user message; get the next question **or** the synthesis |
-| `GET`  | `/session/{session_id}` | Full session state (messages + pattern) |
-| `POST` | `/session/end` | End a session; force a synthesis if enough signal exists |
+| `POST` | **`/mirror/chat`** | **Mirror chat — start or send the next message (recommended)** |
+| `GET`  | `/mirror/chat/{session_id}` | Full mirror chat state (messages + pattern) |
+| `POST` | `/mirror/chat/end` | End chat; force synthesis if enough signal exists |
+| `POST` | `/session/start` | Begin a session (legacy alias) |
+| `POST` | `/session/reply` | Send a user message (legacy alias) |
+| `GET`  | `/session/{session_id}` | Full session state (legacy alias) |
+| `POST` | `/session/end` | End session (legacy alias) |
 | `GET`  | `/patterns/{user_id}` | All confirmed patterns for a user |
 | `POST` | `/insights/growth-area` | Score the six growth areas for the Insights screen |
 
 ---
 
-# 1. The session chat flow
+# 1. Mirror chat (recommended for the Flutter app)
 
-### Lifecycle
+The **Chat** tab runs the Mirror Intelligence System — a turn-based reflective
+conversation. Once a genuine repeating pattern emerges, the mirror returns a
+structured **synthesis** (`PatternObject`).
+
+### One endpoint for the chat screen
+
+Use **`POST /mirror/chat`** for both starting and continuing a conversation.
+
+```
+POST /mirror/chat  { "user_id": "..." }                    → opening + session_id
+POST /mirror/chat  { "session_id": "...", "message": "…" } → question or synthesis
+(repeat until session_complete == true, or POST /mirror/chat/end)
+```
+
+| Turn | Server behavior |
+|------|-----------------|
+| 1–5  | Questions only — never synthesizes this early. |
+| 6–9  | Synthesizes **if** a clear repeating pattern is visible, else asks again. |
+| 10+  | Forces a synthesis. |
+
+Branch on `type` in the response — do not hard-code turn logic on the client.
+
+---
+
+## `POST /mirror/chat` — start
+
+**Request**
+```json
+{ "user_id": "demo-user" }
+```
+
+Do **not** send `session_id` or `message` when starting.
+
+**Response `200`**
+```json
+{
+  "session_id": "f1c3a0a2-7d3a-4c2e-9b1e-0a1b2c3d4e5f",
+  "type": "opening",
+  "content": "Think of a recent moment where you reacted in a way that surprised you. What happened?",
+  "turn": 1,
+  "session_complete": false
+}
+```
+
+Store `session_id`. Render `content` as the first assistant bubble.
+
+### ⚠️ `user_id` must already exist in prod (onboarding ordering)
+
+In production (Supabase active), `sessions.user_id` is a **`NOT NULL` foreign key
+to `public.users(user_id)`** (and so is `patterns.user_id`). So the `user_id` you
+pass when starting **must already be a real row in `public.users`** —
+otherwise the insert fails the FK constraint and the API returns **`500`** (it
+does *not* silently fall back to questions; that fallback would be the app's own
+local handling of the error). In local/in-memory mode any string works.
+
+This matters because the account is normally created at the **end** of
+onboarding — so if you run the Mirror chat *during* onboarding, the user doesn't
+exist yet.
+
+**Required pattern: create the identity up front, upgrade it later.**
+
+1. At the **start** of onboarding, create the user so a `public.users` row
+   exists — e.g. Supabase **anonymous sign-in**
+   (`supabase.auth.signInAnonymously()`), ensuring a matching `public.users` row
+   is created (via your signup trigger, or an explicit insert). Use that user's
+   **UUID** as `user_id`.
+2. Run the Mirror chat normally — sessions/messages/patterns now persist against
+   that UUID.
+3. At the **end** of onboarding, **upgrade** the anonymous user into a permanent
+   account (attach email/password). The **UUID is stable**, so every session and
+   pattern created during onboarding stays linked to the now-permanent account —
+   no migration/relinking needed.
+
+> Plan a periodic cleanup for anonymous users who abandon onboarding (the
+> `on delete cascade` FKs will drop their sessions/messages/patterns with them).
+
+---
+
+## `POST /mirror/chat` — reply
+
+**Request**
+```json
+{
+  "session_id": "f1c3a0a2-7d3a-4c2e-9b1e-0a1b2c3d4e5f",
+  "message": "I went quiet the moment my partner asked what was wrong."
+}
+```
+
+**Response — still asking (`type: "question"`)**
+```json
+{
+  "session_id": "f1c3a0a2-7d3a-4c2e-9b1e-0a1b2c3d4e5f",
+  "type": "question",
+  "content": "What did going quiet protect you from in that moment?",
+  "turn": 3,
+  "session_complete": false
+}
+```
+Here `content` is a **plain string** — render it as the next assistant bubble.
+
+**Response — pattern found (`type: "synthesis"`)**
+```json
+{
+  "session_id": "f1c3a0a2-7d3a-4c2e-9b1e-0a1b2c3d4e5f",
+  "type": "synthesis",
+  "content": {
+    "pattern_name": "Proximity Withdrawal Loop",
+    "pattern_summary": "When closeness asks something of you, you go quiet to stay safe — which creates the distance you feared.",
+    "trigger": "A partner reaching toward you emotionally.",
+    "response": "You withdraw and go silent.",
+    "insight": "The silence isn't absence — it's a guard you post when intimacy feels like exposure.",
+    "next_step": "Next time you feel the pull to go quiet, you could name the urge out loud instead."
+  },
+  "turn": 7,
+  "session_complete": true
+}
+```
+Here `content` is a **`PatternObject`**. When `session_complete` is `true`, stop
+the loop and show the synthesis card.
+
+> **Key client rule:** `content` is a string when `type` is `"opening"` or
+> `"question"`, and an object when `type` is `"synthesis"`. Switch on `type`
+> before parsing `content`.
+
+**Idempotency / edge cases**
+- Replying to an already-complete session returns the **same synthesis** again
+  (`session_complete: true`).
+- If the session ended *without* a pattern, reply returns `409`.
+
+---
+
+## `GET /mirror/chat/{session_id}`
+
+Rehydrate the conversation when the user reopens the Chat tab.
+
+Same shape as `GET /session/{session_id}` — see [Legacy session routes](#2-legacy-session-routes) below.
+
+---
+
+## `POST /mirror/chat/end`
+
+**Request**
+```json
+{ "session_id": "f1c3a0a2-7d3a-4c2e-9b1e-0a1b2c3d4e5f" }
+```
+
+Same behavior as `POST /session/end` — force synthesis when `turn >= 6`, else
+close without fabricating a pattern.
+
+---
+
+# 2. Legacy session routes
+
+The `/session/*` paths behave identically to `/mirror/chat` and remain for
+backward compatibility. New Flutter code should prefer `/mirror/chat`.
+
+### Lifecycle (legacy)
 
 ```
 POST /session/start
@@ -111,9 +270,39 @@ Creates a session and returns the AI's opening question.
 Store `session_id` — every subsequent call needs it. Render `message` as the
 first assistant bubble.
 
-> **Prod note:** if Supabase is active, `user_id` must be a real
-> `public.users(user_id)` UUID (foreign key). In local/in-memory mode any string
-> works.
+### ⚠️ `user_id` must already exist in prod (onboarding ordering)
+
+In production (Supabase active), `sessions.user_id` is a **`NOT NULL` foreign key
+to `public.users(user_id)`** (and so is `patterns.user_id`). So the `user_id` you
+pass to `/session/start` **must already be a real row in `public.users`** —
+otherwise the insert fails the FK constraint and the API returns **`500`** (it
+does *not* silently fall back to questions; that fallback would be the app's own
+local handling of the error). In local/in-memory mode any string works.
+
+This matters because the account is normally created at the **end** of
+onboarding — so if you run the Mirror chat *during* onboarding, the user doesn't
+exist yet.
+
+**Required pattern: create the identity up front, upgrade it later.**
+
+1. At the **start** of onboarding, create the user so a `public.users` row
+   exists — e.g. Supabase **anonymous sign-in**
+   (`supabase.auth.signInAnonymously()`), ensuring a matching `public.users` row
+   is created (via your signup trigger, or an explicit insert). Use that user's
+   **UUID** as `user_id` for `/session/start`.
+2. Run the Mirror chat normally — sessions/messages/patterns now persist against
+   that UUID.
+3. At the **end** of onboarding, **upgrade** the anonymous user into a permanent
+   account (attach email/password). The **UUID is stable**, so every session and
+   pattern created during onboarding stays linked to the now-permanent account —
+   no migration/relinking needed.
+
+> Plan a periodic cleanup for anonymous users who abandon onboarding (the
+> `on delete cascade` FKs will drop their sessions/messages/patterns with them).
+
+> **The Growth Area insight needs none of this** — `POST /insights/growth-area`
+> is stateless and has no user FK, so onboarding can call it before any account
+> exists. This requirement applies only to the session-chat endpoints.
 
 ---
 
@@ -357,18 +546,20 @@ renders (six progress rings or a radar chart).
 ```bash
 BASE=http://localhost:8000
 
-# 1) Start a session
-SID=$(curl -s -X POST $BASE/session/start \
+# 1) Start mirror chat
+START=$(curl -s -X POST $BASE/mirror/chat \
   -H "Content-Type: application/json" \
-  -d '{"user_id":"demo-user"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['session_id'])")
+  -d '{"user_id":"demo-user"}')
+echo "$START" | python3 -m json.tool
+SID=$(echo "$START" | python3 -c "import sys,json;print(json.load(sys.stdin)['session_id'])")
 
 # 2) Reply (repeat until type == "synthesis")
-curl -s -X POST $BASE/session/reply \
+curl -s -X POST $BASE/mirror/chat \
   -H "Content-Type: application/json" \
-  -d "{\"session_id\":\"$SID\",\"user_message\":\"I went quiet when my partner asked what was wrong.\"}"
+  -d "{\"session_id\":\"$SID\",\"message\":\"I went quiet when my partner asked what was wrong.\"}"
 
-# 3) (optional) Force-close the session
-curl -s -X POST $BASE/session/end \
+# 3) (optional) Force-close the chat
+curl -s -X POST $BASE/mirror/chat/end \
   -H "Content-Type: application/json" -d "{\"session_id\":\"$SID\"}"
 
 # 4) List the user's confirmed patterns
@@ -390,22 +581,23 @@ import 'package:http/http.dart' as http;
 
 const baseUrl = 'http://localhost:8000'; // use your deployed URL in prod
 
-// ── Start a session ───────────────────────────────────────────────
-Future<Map<String, dynamic>> startSession(String userId) async {
+// ── Mirror chat — start ───────────────────────────────────────────
+Future<Map<String, dynamic>> startMirrorChat(String userId) async {
   final res = await http.post(
-    Uri.parse('$baseUrl/session/start'),
+    Uri.parse('$baseUrl/mirror/chat'),
     headers: {'Content-Type': 'application/json'},
     body: jsonEncode({'user_id': userId}),
   );
   return jsonDecode(res.body) as Map<String, dynamic>;
+  // → session_id, type:"opening", content (string), turn, session_complete
 }
 
-// ── Send a reply; branch on `type` ────────────────────────────────
-Future<void> sendReply(String sessionId, String message) async {
+// ── Mirror chat — send next message; branch on `type` ─────────────
+Future<void> sendMirrorMessage(String sessionId, String message) async {
   final res = await http.post(
-    Uri.parse('$baseUrl/session/reply'),
+    Uri.parse('$baseUrl/mirror/chat'),
     headers: {'Content-Type': 'application/json'},
-    body: jsonEncode({'session_id': sessionId, 'user_message': message}),
+    body: jsonEncode({'session_id': sessionId, 'message': message}),
   );
   final data = jsonDecode(res.body) as Map<String, dynamic>;
 
@@ -414,7 +606,7 @@ Future<void> sendReply(String sessionId, String message) async {
     // → show synthesis card; session is complete
   } else {
     final question = data['content'] as String;
-    // → render next assistant bubble
+    // → render next assistant bubble (type is "question")
   }
 }
 
@@ -458,4 +650,3 @@ Returned by `/session/reply` (on synthesis), `/session/{id}`, `/session/end`, an
 |-------|------|---------|
 | `id` | string | One of the six canonical area ids. |
 | `value` | int | `0–100`. |
-```

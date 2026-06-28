@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 
 from config import get_settings
 from models.schemas import HealthResponse
-from routes import growth_area, patterns, session
+from routes import growth_area, mirror, patterns, session
 from services.model_service import ModelUnavailableError
 from services.supabase_service import StorageError, get_store
 
@@ -42,6 +42,7 @@ app.add_middleware(
 )
 
 # ── Routers ────────────────────────────────────────────────────────────
+app.include_router(mirror.router)
 app.include_router(session.router)
 app.include_router(patterns.router)
 app.include_router(growth_area.router)
