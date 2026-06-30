@@ -171,11 +171,13 @@ and the same for `patterns`).
      ```
 4. **Environment** tab → add:
    ```
+   PYTHON_VERSION=3.12.8
    APP_ENV=production
    SUPABASE_URL=...
-   SUPABASE_SERVICE_KEY=...        # (or SUPABASE_ANON_KEY)
+   SUPABASE_SERVICE_KEY=...
    HF_API_TOKEN=...
-   HF_MODEL_URL=https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3
+   HF_MODEL_URL=https://router.huggingface.co/v1/chat/completions
+   HF_MODEL=Qwen/Qwen2.5-7B-Instruct
    ```
 5. Deploy. Verify `GET /health` returns
    `{"status":"ok","environment":"production","model":"huggingface"}`.

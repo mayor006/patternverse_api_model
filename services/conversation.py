@@ -21,26 +21,49 @@ from services.model_service import generate_response
 logger = logging.getLogger("patternverse.conversation")
 
 # ── The canonical system prompt for every conversation ─────────────────
-# Grounded in Patternverse_Mirror_Intelligence_System_v1.0: the mirror stays a
-# mirror, and questioning traces the meaning chain rather than circling one link.
+# Grounded in Patternverse Response Style Reference + MIS v1.0 doctrine.
 SYSTEM_PROMPT = """You are the Patternverse Mirror Intelligence System. Governing doctrine: the mirror stays a mirror. You help a person see the pattern beneath their problem by tracing — one careful step at a time — the chain that links what happened to what they keep repeating:
 
   Event → Meaning → Emotion → Reaction → Outcome → Repetition → Pattern
 
-You are not a chatbot, a coach, or a therapist. You reflect; you do not advise, flatter, judge, diagnose, or reassure.
+You are not a chatbot, a coach, or a therapist. You reflect; you do not advise, flatter, judge, diagnose, or prescribe.
+
+RESPONSE STYLE (every question turn — match this exactly)
+
+Write like a warm, attentive human in a chat bubble — natural, specific, emotionally literate. NOT a clinician, intake form, or template bot.
+
+Structure: two short paragraphs.
+1) REFLECT — Show you actually heard them. Name their specifics in fresh language (the situation, the feelings they named, the weight of carrying it). You may open with "I hear that —" when it fits. Acknowledge what it costs them to carry this — without clinical labels or stiff summaries.
+2) DIRECTIVE — Exactly ONE forward-moving question (a compound question on the same dimension is fine). Move deeper along the chain — meaning, emotion texture, need/fear beneath it, reaction, cost, or whether this has happened before. Never sideways.
+
+GOOD example (user said they feel overwhelmed in an academic comeback season with constant anxiety):
+"I hear that — you're in this push to turn things around academically, and underneath that push is a constant hum of anxiety that won't settle. That's a lot of weight to carry at the same time.
+
+What does the anxiety feel like right now? Is it specifically about the academic stuff, or is it more like a baseline thing that's just there?"
+
+BAD example (never write like this — stiff keyword echo + generic probe):
+"This academic comeback season has been particularly challenging and has brought a lot of anxiety. Can you think of a specific recent moment during this season when you felt overwhelmed and anxious?"
+
+FORBIDDEN PHRASING
+- Never open with "Can you describe/think of a specific situation/moment/recent time…" when they already gave context — that re-asks sideways instead of going deeper.
+- Never summarize their words back as "This [their exact phrase] has been particularly challenging/difficult/hard."
+- Never use unearned clinical validation: "It must have been tough", "That must be hard", "I'm sorry you're going through this."
+- Never use hollow templates: "You mentioned…", "You said…", "It sounds like… you feel", "Can you think of a specific recent moment when…"
+- Never state causal chains as settled fact ("…which caused you to…", "…which led you to feel…") unless they said it that way.
+- Never name a loop/pattern until the same trigger→reaction has appeared in at least THREE separate instances.
 
 HOW YOU ASK
-- Ask exactly ONE question per turn, and make it move FORWARD along the chain. Never re-ask something already answered. Once you have the event, go after the meaning; then the emotion and the need or fear beneath it; then the reaction; then the outcome and its cost; then whether it has happened before.
-- Build every question from the user's own words — echo a specific detail they gave, then go one layer deeper. Never use templates like "You mentioned…", "You said…", or "It sounds like… you feel".
-- Listen for: the meaning the user assigned to an event, the need or fear underneath, hidden beliefs, self-blame, avoidance or deflection, contradictions, and identity language ("I'm the kind of person who…").
-- If the user is vague, ask for ONE concrete instance — a specific time it happened — rather than asking how they feel again.
+- Ask exactly ONE question per turn (one dimension; a two-part question on that dimension is OK). Move FORWARD along the chain. Never re-ask something already answered.
+- Build from their specifics — echo real details in your own voice, not by swapping their keywords into a formula.
+- Listen for: the meaning assigned to an event, need or fear underneath, hidden beliefs, self-blame, avoidance, contradictions, identity language ("I'm the kind of person who…").
+- If they were vague about the event itself, ask for ONE concrete instance — but if they already named the situation (e.g. academic comeback + anxiety), go deeper into meaning/emotion/reaction instead of asking for "a specific moment" again.
 
 DRIFT CONTROL (non-negotiable)
 - Portrait drift: never flatter, advise, judge, or reassure to feel pleasing.
 - Generic drift: never reach for a plausible, pre-written-sounding insight. Trace THIS person's specifics only.
-- Repetition before loop: never name a "loop" or "pattern" until the same trigger→reaction has appeared in at least THREE separate instances. One moment is not a loop.
-- Insufficiency before fabrication: if the signal is too thin to name anything honestly, keep asking — never invent a pattern to seem insightful.
-- Sovereignty before certainty: the user is the authority on their own meaning. Offer reflection as something they can accept, edit, or reject — never as a verdict.
+- Repetition before loop: never name a "loop" or "pattern" until three instances are visible.
+- Insufficiency before fabrication: if signal is too thin, keep asking — never invent a pattern.
+- Sovereignty before certainty: reflection is something they can accept, edit, or reject — never a verdict.
 
 SYNTHESIS — return ONLY this JSON object (and nothing else) once a genuine repeating pattern (three instances) is visible:
 {
@@ -52,7 +75,7 @@ SYNTHESIS — return ONLY this JSON object (and nothing else) once a genuine rep
   "next_step": "one small, concrete option the user could choose — an option, never a prescription"
 }
 
-Tone: calm, intelligent, emotionally precise. Never clinical, never motivational, never spiritual, never gushing."""
+Tone: calm, intelligent, emotionally precise, human. Never clinical, never motivational, never spiritual, never gushing."""
 
 # An instruction appended (NOT stored) when we explicitly ask for synthesis,
 # e.g. at turn 10+ or on /session/end.
@@ -100,50 +123,63 @@ _RECURRENCE_FOCUS = (
 # the chain — never sideways into ground already covered.
 def _question_nudge(focus: str) -> str:
     return (
-        "Reply like a warm, attentive person who is genuinely listening — natural and human, "
-        "never a clinician or a form. First, react to the SPECIFIC thing I just said (echo a real "
-        "detail of mine, but never with stock openers like 'You mentioned', 'You said', 'It sounds "
-        "like', or 'You feel', and never just swap one emotion word into a template). Then ask me "
-        f"exactly ONE genuine question that moves us forward to {focus}. "
-        "Crucially: do NOT re-ask anything I've already answered — look back over everything I've "
-        "told you and go one layer deeper, never sideways into the same ground. One question only. "
-        "It is still early: no summary, no advice, no diagnosis, no JSON. Two or three sentences."
+        "Reply in TWO short paragraphs (reflect, then one forward question). "
+        "Paragraph 1: warm, natural acknowledgment — name their specifics in your own words, "
+        "the weight they're carrying (you may use 'I hear that —'). NOT a stiff keyword summary "
+        "like 'This X has been particularly challenging.' "
+        f"Paragraph 2: exactly ONE genuine question moving toward {focus}. "
+        "Do NOT ask 'Can you think of/describe a specific recent moment…' if they already "
+        "described the situation — go deeper, not sideways. "
+        "Do NOT re-ask anything they've already answered. No advice, no diagnosis, no JSON. "
+        "Match the GOOD example in your system prompt."
     )
 
 
-# Appended (NOT stored) on the 6-9 window, where synthesis is allowed once the same
-# trigger→reaction has recurred three times. Be decisive: synthesize as soon as the
-# threshold is met instead of fishing for more examples.
 def _open_nudge(focus: str) -> str:
     return (
-        "Count the distinct instances I've described where the SAME trigger led to the SAME "
-        "reaction. If that count is three or more, you MUST output ONLY the synthesis JSON object "
-        "now (keys: pattern_name, pattern_summary, trigger, response, insight, next_step) and "
-        "nothing else — do NOT ask for further examples once three are present. If it is still "
-        "fewer than three, do not name a pattern yet: react naturally to what I just said (no "
-        "'You mentioned/said/feel' templates), then ask exactly ONE question that moves us toward "
-        f"{focus}, without re-asking anything I've already answered. No advice. Two or three "
-        "sentences."
+        "Count distinct instances where the SAME trigger led to the SAME reaction. "
+        "If three or more, output ONLY the synthesis JSON (pattern_name, pattern_summary, "
+        "trigger, response, insight, next_step) and nothing else. "
+        "If fewer than three: TWO short paragraphs — (1) warm natural reflect on what they "
+        "just said, naming specifics and weight without stiff templates; (2) exactly ONE "
+        f"question toward {focus}. No 'Can you think of a specific moment' if context exists. "
+        "No advice. Match the GOOD example in your system prompt."
     )
 
 
-# Stock openers the doctrine forbids (template restatement = portrait/generic drift).
-# Used to detect a low-quality reply and trigger a single regenerate, then a
-# deterministic strip as a last resort.
+# Stock openers / clinical templates that indicate a low-quality reply.
+# Triggers a single regenerate, then deterministic cleanup as last resort.
 _BANNED_OPENER = re.compile(
     r"^\s*(it sounds like|it seems like|it seems that|you mentioned|you said|"
-    r"you feel|you're feeling|you are feeling|i hear that|i can hear|i can see that)\b",
+    r"you feel|you're feeling|you are feeling|i can see that)\b",
     re.IGNORECASE,
 )
-_ANTI_OPENER_RIDER = (
-    " IMPORTANT: do NOT begin your reply with 'It sounds like', 'It seems', 'You mentioned', "
-    "'You said', 'You feel', 'I hear that', or any restatement of my words. Open instead with a "
-    "fresh, specific reaction in your own voice."
+_CLINICAL_TEMPLATE = re.compile(
+    r"(?i)("
+    r"can you (?:think of|describe) a specific (?:recent )?(?:moment|situation|time|instance)|"
+    r"this .{0,80} has been particularly (?:challenging|difficult|hard|tough)|"
+    r"it must have been (?:tough|hard|difficult)|"
+    r"that must be (?:tough|hard|difficult)|"
+    r"i(?:'m| am) sorry you(?:'re| are) going through"
+    r")",
+)
+_ANTI_TEMPLATE_RIDER = (
+    " CRITICAL: Do NOT write like the BAD example. Two paragraphs: warm reflect "
+    "(I hear that — …), then one forward question going DEEPER — not 'Can you think of "
+    "a specific recent moment' and not 'This X has been particularly challenging.'"
 )
 
 
 def _has_banned_opener(text: str) -> bool:
     return bool(text) and bool(_BANNED_OPENER.match(text))
+
+
+def _has_clinical_template(text: str) -> bool:
+    return bool(text) and bool(_CLINICAL_TEMPLATE.search(text))
+
+
+def _needs_style_retry(text: str) -> bool:
+    return _has_banned_opener(text) or _has_clinical_template(text)
 
 
 def _strip_stock_opener(text: str) -> str:
@@ -169,16 +205,16 @@ def _strip_stock_opener(text: str) -> str:
 # the reflection task instead of drifting into pretraining-style text.
 OPENING_KICKOFF = (
     "I want to understand an emotional or behavioral pattern I keep repeating. "
-    "This is the very beginning of our conversation — I have not told you anything "
-    "about myself yet, so do not reference anything I've supposedly said. Open by "
-    "asking me a single, broad first question to get started — just one question, "
-    "in your own words, and nothing else."
+    "This is the very beginning — I have not told you anything about myself yet. "
+    "Open warmly with a single, broad first question in plain human language. "
+    "NOT clinical ('Can you describe a specific situation or event that leads to…'). "
+    "One question only, nothing else."
 )
 
 # Graceful fallbacks.
 DEFAULT_OPENING = (
-    "Think of a recent moment where you reacted in a way that surprised you, "
-    "or that you've reacted in before. What happened?"
+    "What's been on your mind lately — something you've noticed yourself doing or "
+    "feeling again and again?"
 )
 FALLBACK_QUESTION = (
     "Can you say more about what was going through your mind in that moment?"
@@ -256,16 +292,13 @@ async def converse(
     messages = build_model_messages(stored_messages, nudge=nudge)
     text = _clean(await generate_response(messages))
 
-    # A valid synthesis JSON is exempt from opener checks; only police questions.
-    if parse_pattern(text) is None and _has_banned_opener(text):
-        # Re-roll once with an explicit anti-template rider; the small model often
-        # complies on the second pass.
-        retry_messages = build_model_messages(stored_messages, nudge=nudge + _ANTI_OPENER_RIDER)
+    # A valid synthesis JSON is exempt from style checks; only police question turns.
+    if parse_pattern(text) is None and _needs_style_retry(text):
+        retry_messages = build_model_messages(stored_messages, nudge=nudge + _ANTI_TEMPLATE_RIDER)
         retry = _clean(await generate_response(retry_messages))
-        if retry and (parse_pattern(retry) is not None or not _has_banned_opener(retry)):
+        if retry and (parse_pattern(retry) is not None or not _needs_style_retry(retry)):
             text = retry
         else:
-            # Still templated — strip the leading clause deterministically.
             text = _strip_stock_opener(text)
 
     return text
